@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (J-Link) - EP_AGORA",
+            "request": "launch",
+            "type": "cortex-debug",
+            "cwd": "${workspaceRoot}",
+            "executable": "${workspaceRoot}/BUILD/EP_AGORA/GCC_ARM-DEBUG/ep-example-one-edge.elf",
+            "servertype": "jlink",
+            "device": "nRF52840_xxAA",
+            "interface": "swd"
+        },
+        {
+            /* Starts debug session using the Cortex-Debug extension and pyOCD GDB server. Currently, this configuration doesn't work when the
+            DAPLink device is passed through to a VM. */
+            "name": "Debug (pyOCD) - EP_AGORA",
+            "request": "launch",
+            "type": "cortex-debug",
+            "cwd": "${workspaceRoot}",
+            "executable": "${workspaceRoot}/BUILD/EP_AGORA/GCC_ARM-DEBUG/ep-example-one-edge.elf",
+            "servertype": "pyocd",
+            "device": "nRF52840_xxAA",
+            "interface": "swd"
+        }
+    ]
+}
