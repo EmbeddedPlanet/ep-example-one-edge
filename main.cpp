@@ -23,6 +23,8 @@
 
 #include "mbed_trace.h"
 #include "CellularDevice.h"
+#include "one_edge.h"
+#include "Si7021.h"
 
 #define TRACE_GROUP   "MAIN"
 #define ONEEDGE_CLIENT_STATE_MAX_LENGTH 20
@@ -30,6 +32,9 @@
 // Global pointers
 CellularDevice *dev;
 ATHandler *at_handler;
+I2C i2c(PIN_NAME_SDA, PIN_NAME_SCL);
+Si7021 si7021(i2c);
+DigitalOut sensor_power_enable(PIN_NAME_SENSOR_POWER_ENABLE);
 
 /**
  * OneEdge LWM2M client enabling status
@@ -124,6 +129,127 @@ void set_battery_level(int battery_level)
     at_handler->unlock();
 }
 
+bool file_exists(char *target_file)
+{
+    at_handler->lock();
+
+    at_handler->cmd_start_stop("#M2MLIST", "=/XML");
+    at_handler->resp_start("#M2MLIST:");
+
+    while (at_handler->info_resp()) {
+        char m2mlist_entry[ONEEDGE_MAX_FULL_FILE_PATH_LENGTH];
+        at_handler->read_string(m2mlist_entry, sizeof(m2mlist_entry));
+        if (strstr(m2mlist_entry, target_file) != NULL) {
+            at_handler->resp_stop();
+            at_handler->unlock();
+            return true;
+        }
+    }
+
+    at_handler->resp_stop();
+    at_handler->unlock();
+    return false; 
+}
+
+bool enable_temperature_object()
+{
+    // Check if the object description file already exists on the modem
+    if (file_exists("object_3303.xml")) {
+        tr_debug("'object_3303.xml' file found!");
+        return true;
+    }
+
+    at_handler->lock();
+
+    int write_size = 0;
+
+    // Write the file to the modem
+    at_handler->cmd_start_stop("#M2MWRITE", "=", "%s%d", "/XML/object_3303.xml", strlen(get_object_3303()));
+    at_handler->resp_start(">>>", true);
+
+    if (at_handler->get_last_error() != NSAPI_ERROR_OK) {
+        tr_warn("Unable to send file");
+        at_handler->unlock();
+        return false;
+    }
+
+    write_size = at_handler->write_bytes((uint8_t *)get_object_3303(), strlen(get_object_3303()));
+    if (write_size < strlen(get_object_3303())) {
+        tr_warn("Unable to send full object_3303.xml file");
+        at_handler->unlock();
+        return false;
+    }
+    at_handler->resp_start("\r\nOK", true);
+    at_handler->resp_stop();
+
+    if (at_handler->get_last_error() != NSAPI_ERROR_OK) {
+        tr_warn("Error sending object_3303.xml file");
+        at_handler->unlock();
+        return false;
+    }
+
+    tr_debug("object_3303.xml file sent");
+
+    // Now that the file has been sent, we need to trigger a module reboot
+    at_handler->at_cmd_discard("#REBOOT", "");
+    at_handler->unlock();
+
+    // Wait for the module to reboot
+    ThisThread::sleep_for(10s);
+
+    // Reset the MCU
+    tr_info("Resetting to have the new settings take effect");
+    NVIC_SystemReset();
+
+    return true;
+}
+
+bool create_temperature_object_instance(int instance = 0)
+{
+    at_handler->lock();
+    
+    // Read the resource first to see if it already exists
+    at_handler->at_cmd_discard("#LWM2MR", "=", "%d%d%d%d%d",
+                0,          // Telit instance
+                3303,       // Temperature object
+                instance,   // Object instance
+                5700,       // Current value resource ID
+                0);         // Resource instance ID
+    if (at_handler->get_last_error() == NSAPI_ERROR_OK) {
+        // Resource already exists
+        at_handler->unlock();
+        return true;
+    }
+
+    at_handler->clear_error();
+    at_handler->flush();
+    at_handler->at_cmd_discard("#LWM2MNEWINST", "=", "%d%d%d", 0, 3303, instance);
+
+    return at_handler->unlock_return_error() == NSAPI_ERROR_OK;
+}
+
+void set_temperature(float temperature)
+{
+    char temperature_string[MAX_TEMP_LENGTH];
+
+    snprintf(temperature_string, MAX_TEMP_LENGTH, "%0.2f", temperature);
+    tr_info("Setting the temperature resource to %0.2f", temperature);
+    at_handler->lock();
+
+    at_handler->set_at_timeout(LWM2MSET_AT_TIMEOUT);
+    at_handler->cmd_start("AT#LWM2MSET=");
+    at_handler->write_int(LWM2MSET_FLOAT_TYPE);             // Float type
+    at_handler->write_int(TEMPERATURE_OBJECT_ID);           // Temperature object ID
+    at_handler->write_int(0);                               // Object instance
+    at_handler->write_int(SENSOR_VALUE_RESOURCE_ID);        // Resource ID
+    at_handler->write_int(0);                               // Resource instance (0)
+    at_handler->write_string(temperature_string, false);    // New value
+    at_handler->cmd_stop_read_resp();
+    at_handler->restore_at_timeout();
+
+    at_handler->unlock();
+}
+
 int main()
 {
     // Initialize mbed trace
@@ -134,7 +260,7 @@ int main()
 #endif
 
     tr_info("************************************************");
-    tr_info("* Embedded Planet Telit OneEdge Example v0.1.0 *");
+    tr_info("* Embedded Planet Telit OneEdge Example v0.2.0 *");
     tr_info("************************************************");
 
     // Make sure we're running on a compatible EP target
@@ -168,6 +294,18 @@ int main()
         tr_warn("Unable to enable the Telit OneEdge LWM2M client");
     }
     at_handler->unlock();
+
+    // Setup the temperature object instance
+    if (!enable_temperature_object()) {
+        tr_error("Unable to enable temperature object!");
+        while (1);
+    }
+
+    // Create an instance of the temperature object
+    if (!create_temperature_object_instance()) {
+        tr_error("Unable to create an instance of the temperature object!");
+        while (1);
+    }
 
     // Wait until the client is registered
     bool registered = false;
@@ -209,6 +347,21 @@ int main()
 
     tr_info("Client registered");
 
+    // Enable power to the sensors
+    tr_info("Enabling power to the sensors");
+    sensor_power_enable = 1;
+    ThisThread::sleep_for(500ms);
+
+    // Make sure the SI7021 is online
+    bool si7021_online = false;
+    if (si7021.check()) {
+        tr_info("SI7021 online");
+        si7021_online = true;
+    } else {
+        tr_error("SI7021 offline!");
+        si7021_online = false;
+    }
+
     int battery_level = 100;
 
     while (1) {
@@ -219,6 +372,15 @@ int main()
         battery_level--;
         if (battery_level < 0) {
             battery_level = 100;
+        }
+
+        // Handle reading the temperature
+        if (si7021_online) {
+            // Perform a measurement
+            si7021.measure();
+
+            // Update the temperature resource
+            set_temperature(si7021.get_temperature() / 1000.0);
         }
 
         // Sleep for 30 seconds
